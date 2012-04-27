@@ -89,6 +89,10 @@ class ProductInfo(object):
         self.qty = qty
         self.price = price
         self.normalized_price = self.price - ((self.price * 0.01) * self.quality)
+        # the reduced % should be based off products base price, for the moment 
+        # I introduce a hack to mitigate the damage
+        if self.quality == 999:
+            self.normalized_price = float("inf")
 
 def import_create_prod_info(cells):
     return ProductInfo(
@@ -218,9 +222,12 @@ def load_config(path=CONFIG):
         sys.exit(1)
 
 def main():
+
+    config = load_config()
+    
     # set-up logging
     logging.basicConfig(
-        filename='economies_of_scale.log', 
+        filename=config['log-file'], 
         filemode='a', level=logging.DEBUG, 
         format='[%(levelname)s:%(asctime)s]%(message)s',
         datefmt='%m/%d/%Y %H:%M:%S'
@@ -228,7 +235,6 @@ def main():
     
     logging.info("starting re-stocking")
     
-    config = load_config()
     web = Web(config)
     
     restocker = ReStocker(web, config)
