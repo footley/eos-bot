@@ -111,7 +111,7 @@ def import_create_prod_info(cells):
 def b2b_create_prod_info(cells):
     return ProductInfo(
         float(cells[2].text),
-        float(cells[3].text).replace(',', ''),
+        float(cells[3].text.replace(',', '')),
         float(cells[4].text[1:].replace(',', '')))
 
 class ImportClosedError(Exception):
@@ -319,8 +319,12 @@ def main():
     
     web = Web(config)
     
-    eos = EOS(web, config)
-    eos.go()
+    try:
+        eos = EOS(web, config)
+        eos.go()
+    except Exception, e:
+      logging.error(str(e))
+      sys.exit(1)
     
     logging.info("finished, with {0} requests".format(web.num_requests))
 
