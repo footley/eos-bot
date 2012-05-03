@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import re
 import sys
 import json
@@ -11,8 +13,14 @@ from bs4 import BeautifulSoup
 
 CONFIG = 'economies_of_scale.config'
 
+# re-stocker regexs
 total_qty_re = re.compile("^Total Quantity: ")
 buy_click_re = re.compile("^mB.buyFromMarket\(")
+# R&D regexs
+rd_inuse_re = re.compile('Time remaining')
+rd_expanding_re = re.compile('rnd-expand-status\.php\?frid=')
+research_elsewhere_re = re.compile('Currently being researched at another')
+cash_re = re.compile("\$[0-9]+,?[0-9]*")
 
 class Web(object):
     def __init__(self, config):
@@ -82,7 +90,7 @@ class Web(object):
     def get_page_soup(self, url, data=None, cache=False):
         source = self.read_page(url, data, cache)
         return BeautifulSoup(source)
-        
+
 class ProductInfo(object):
     def __init__(self, quality, qty, price):
         self.quality = quality
@@ -103,8 +111,14 @@ def import_create_prod_info(cells):
 def b2b_create_prod_info(cells):
     return ProductInfo(
         float(cells[2].text),
-        float(cells[3].text),
+        float(cells[3].text).replace(',', ''),
         float(cells[4].text[1:].replace(',', '')))
+
+class ImportClosedError(Exception):
+    def __init__(self, msg):
+        self.msg = msg
+    def __str__(self):
+        return repr(self.msg)
 
 class ReStocker(object):
     def __init__(self, web, config):
@@ -115,6 +129,8 @@ class ReStocker(object):
         prods = []
         for page in range(1, 16):
             soup = self.web.get_page_soup(self.config['urls'][store_url_key].format(self.config["store_classes"][store["class"]][store_id_key], page), cache=True)
+            if soup.find('h3', text='Market Closed'):
+                raise ImportClosedError('Import closed for the night')
             anchor = soup.find('a', text=prod["name"])
             if not anchor and len(prods) > 0:
                 return sorted(prods, key=lambda p: p.normalized_price)
@@ -193,25 +209,93 @@ class ReStocker(object):
             self.buy_prod(store, prod)
         
     def process_store(self, store):
-        logging.info("processing {0}: {1}".format(store["company_name"], store["class"]))
-        
-        # switch to the stores parent company
-        data = {
-            'new_active_firm': store["company_id"],
-        }
-        self.web.read_page(self.config['urls']['switch_company'], data)
+        logging.info("processing {0}".format(store["class"]))
         
         # re-stock the products
-        store_soup = self.web.get_page_soup(self.config['urls']['store_inv'].format(store["store_id"]))
+        store_soup = self.web.get_page_soup(self.config['urls']['store_inv'].format(store["id"]))
         for prod in store["products"]:
             self.process_prod(store_soup, store, prod)
         
         # then hit the lazy x2 button
-        self.web.read_page(self.config['urls']['store_lazyx2'].format(store["store_id"]))
+        self.web.read_page(self.config['urls']['store_lazyx2'].format(store["id"]))
+    
+    def go(self, company):
+        try:
+            for store in company["stores"]:
+                self.process_store(store)
+        except ImportClosedError, e:
+            logging.info(e)
+            return
+            
+class RandDKickstart(object):
+    def __init__(self, web, config):
+        self.web = web
+        self.config = config
+    
+    def process_rd(self, rd):
+        # get the r&d centers page
+        soup = self.web.get_page_soup(self.config['urls']['r&d_page'].format(rd["id"]))
+         
+        # check if already researching: if so nothing
+        if soup.find(text=rd_inuse_re):
+            logging.info("R&D Centre {0} already researching".format(rd["name"]))
+            return
+        
+        if re.search(rd_expanding_re, soup.prettify()):
+            logging.info("R&D Centre {0} being expanded".format(rd["name"]))
+            return
+        
+        # otherwise determine the research (from the set of topics) which takes the least money and start it
+        items = []
+        for topic in rd["topics"]:
+            img = soup.find('img', {'title': topic["name"]})
+            div = img.findParent('div')
+            if div.find(text=research_elsewhere_re):
+                continue
+            money = div.find(text=cash_re)
+            print money
+            start_a = img.findParent('a')
+            url = self.config["urls"]["home"] + start_a["href"]
+            
+            items.append([float(money.strip(' $').replace(',', '')), url, topic["name"]])
+        items = sorted(items, key=lambda p: p[0])
+        
+        if len(items) == 0:
+            logging.info("No valid interesting topics for reasearch {0}".format(rd["name"]))
+            return
+        
+        # start the reasearch
+        logging.info("R&D Centre {0} starting to research {1}".format(rd["name"], items[0][2]))
+        self.web.read_page(items[0][1])
+    
+    def go(self, company):
+        for rd in company["r&d centers"]:
+            self.process_rd(rd)
+            
+
+class EOS(object):
+    def __init__(self, web, config):
+        self.web = web
+        self.config = config
+        
+    def process_company(self, company):
+        logging.info("staring to process company {0}".format(company["name"]))
+        
+        # switch to the stores parent company
+        data = {
+            'new_active_firm': company["id"],
+        }
+        self.web.read_page(self.config['urls']['switch_company'], data)
+        
+        stock = ReStocker(self.web, self.config)
+        stock.go(company)
+        
+        rd_kick = RandDKickstart(self.web, self.config)
+        rd_kick.go(company)
     
     def go(self):
-        for store in self.config["stores"]:
-            self.process_store(store)
+        for company in self.config["companies"]:
+            self.process_company(company)
 
 def load_config(path=CONFIG):
     # Load main config file
@@ -221,8 +305,8 @@ def load_config(path=CONFIG):
         logging.error("Error parsing configuration {0}: {1}".format(CONFIG, e))
         sys.exit(1)
 
-def main():
 
+def main():
     config = load_config()
     
     # set-up logging
@@ -233,14 +317,12 @@ def main():
         datefmt='%m/%d/%Y %H:%M:%S'
         )
     
-    logging.info("starting re-stocking")
-    
     web = Web(config)
     
-    restocker = ReStocker(web, config)
-    restocker.go()
+    eos = EOS(web, config)
+    eos.go()
     
-    logging.info("re-stocking finished, with {0} requests".format(web.num_requests))
+    logging.info("finished, with {0} requests".format(web.num_requests))
 
 
 if __name__ == "__main__":
